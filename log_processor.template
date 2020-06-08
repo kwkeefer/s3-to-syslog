@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Lambda functions for processing logs in S3 and sending them to Syslog.
+Parameters:
+  VpcId:
+    Description: The VPC ID to deploy into.
+    Type: String
+  SubnetIds:
+    Description: A comma separated list of SubnetIds to attach the lambda to.
+    Type: CommaDelimitedList
+  BucketName:
+    Description: Bucket that this lambda function will be processing.
+    Type: String
+  SyslogAddress:
+    Description: Where to send the syslog messages
+    Type: String
+  LambdaMemory:
+    Description: Size of lambda function
+    Default: 128
+    Type: Number
+  LambdaTimeout:
+    Description: Timeout of lambda function.
+    Default: 120
+    Type: Number
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: IAM role for CloudWatch Log Processing lambda.
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: S3Read
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:HeadObject'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${Bucket}'
+                    - {Bucket: !Ref BucketName}
+                  - !Sub
+                    - 'arn:aws:s3:::${Bucket}/*'
+                    - {Bucket: !Ref BucketName}
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DeleteNetworkInterface"
+                Resource: "*"
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for CloudWatch Log Processing lambda
+      GroupName: VPCLambdaOutbound
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+      VpcId: !Ref VpcId
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          from logging import handlers
+          import uuid
+          from urllib.parse import unquote_plus
+
+          s3_client = boto3.client('s3')
+
+          logging_server = os.environ['SYSLOG_DESTINATION']
+          syslog_logger = logging.getLogger('SYSLOG')
+          syslog_logger.setLevel(logging.DEBUG)
+
+          syslog_handler = handlers.SysLogHandler(address=(logging_server, 514),
+                                                          facility=logging.handlers.SysLogHandler.LOG_LOCAL1)
+
+          syslog_logger.addHandler(syslog_handler)
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = unquote_plus(record['s3']['object']['key'])
+                  tmpkey = key.replace('/', '')
+                  download_path = '/tmp/{}{}'.format(uuid.uuid4(), tmpkey)
+                  s3_client.download_file(bucket, key, download_path)
+                  with open(download_path) as f:
+                      loglines = f.read().splitlines()
+
+                  for log in loglines:
+                      # print(log)
+                      syslog_logger.info(log)
+      Description: Lambda for processing S3 logs and sending to SysLog.
+      Environment:
+        Variables:
+          SYSLOG_DESTINATION: !Ref SyslogAddress
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemory
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.7
+      Timeout: !Ref LambdaTimeout
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds: !Ref SubnetIds
